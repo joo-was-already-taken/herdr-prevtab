@@ -1,0 +1,22 @@
+id = "prevtab"
+name = "PrevTab"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Jump to the previously active tab"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+[[startup]]
+command = [
+  "sh",
+  "-c",
+  "nohup target/release/herdr-prevtab run >/dev/null 2>&1 & disown",
+]
+
+[[actions]]
+id = "jump_back"
+title = "Jump to the previously active tab"
+contexts = ["workspace"]
+command = ["target/release/herdr-prevtab", "jump-back"]

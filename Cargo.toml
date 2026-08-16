@@ -1,0 +1,21 @@
+[package]
+name = "herdr-prevtab"
+version = "0.1.0"
+edition = "2024"
+description = "Jump to the previously focused Herdr tab"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+env_logger = "0.11.11"
+log = "0.4.33"
+rustix = { version = "1.1.4", features = ["fs"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+
+[lints.clippy]
+correctness = "warn"
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+missing_errors_doc = { level = "allow", priority = 1 }
+missing_panics_doc = { level = "allow", priority = 1 }

@@ -1,0 +1,231 @@
+use serde_json::json;
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
+
+const SHORT_PLUGIN_ID: &str = "prevtab";
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("{0}")]
+    Herdr(#[from] HerdrError),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum HerdrError {
+    #[error("{0}")]
+    InvalidJson(#[from] serde_json::Error),
+    #[error("invalid tab format: '{0}'")]
+    InvalidTabFormat(String),
+    #[error("unexpected response")]
+    ConnectionClosed,
+    #[error("unexpected JSON")]
+    UnexpectedJson,
+    #[error("subscription failed: {0}")]
+    SubscriptionFailed(String),
+}
+
+pub struct PreviousTabPath<'a> {
+    pub dir: &'a Path,
+    pub ws_id: &'a str,
+}
+
+impl PreviousTabPath<'_> {
+    pub fn read(&self) -> io::Result<String> {
+        let content = fs::read_to_string(self.path())?;
+        Ok(content.trim().to_string())
+    }
+
+    pub fn write(&self, tab_id: &str) -> io::Result<()> {
+        let path = self.path();
+        let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(tab_id.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.join(format!("ws_{}", self.ws_id))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CurrentTabs {
+    pub current_tabs: BTreeMap<String, String>,
+}
+
+impl CurrentTabs {
+    pub fn on_tab_focused(
+        &mut self,
+        tab_id: &str,
+        state_dir: &Path,
+    ) -> Result<(), Error> {
+        use std::collections::btree_map::Entry;
+
+        let Some((workspace_id, _)) = tab_id.split_once(':') else {
+            return Err(HerdrError::InvalidTabFormat(tab_id.to_string()).into());
+        };
+
+        let cur_tab_entry = self.current_tabs.entry(workspace_id.to_string());
+        if let Entry::Occupied(entry) = &cur_tab_entry
+            && entry.get() != tab_id
+        {
+            PreviousTabPath {
+                dir: state_dir,
+                ws_id: workspace_id,
+            }
+            .write(entry.get())?;
+        }
+        cur_tab_entry.insert_entry(tab_id.to_string());
+        Ok(())
+    }
+}
+
+pub fn jump_back(socket_path: &Path, tab_id: &str) -> Result<(), Error> {
+    let stream = UnixStream::connect(socket_path)?;
+    let req_id = format!("{SHORT_PLUGIN_ID}_jump_back");
+    let req_json = format!(
+        "{}",
+        json!(
+            {
+                "id": &req_id,
+                "method": "tab.focus",
+                "params": {
+                    "tab_id": tab_id
+                }
+            }
+        )
+    );
+    assert!(!req_json.contains('\n'));
+    writeln!(&stream, "{req_json}")?;
+    // TODO: wait for the response for better diagnostics
+    Ok(())
+}
+
+pub fn run_subscriber(socket_path: &Path, state_path: &Path) -> ! {
+    let mut backoff = Duration::from_millis(10);
+    let max = Duration::from_secs(2);
+    loop {
+        if let Err(e) = subscribe_and_run(socket_path, state_path) {
+            log::warn!("{e}, reconnecting in {backoff:?}");
+        }
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(max);
+    }
+}
+
+fn subscribe_and_run(socket_path: &Path, state_dir: &Path) -> Result<(), Error> {
+    let mut state = CurrentTabs::default();
+
+    if let Ok(mut snapshot_stream) = UnixStream::connect(socket_path) {
+        let mut snapshot_reader = BufReader::new(snapshot_stream.try_clone()?);
+        if let Ok(Some(tab_id)) =
+            fetch_herdr_snapshot(&mut snapshot_stream, &mut snapshot_reader)
+        {
+            let _ = state.on_tab_focused(&tab_id, state_dir);
+        } else {
+            log::warn!("failed to fetch herdr snapshot");
+        }
+    }
+
+    let stream = UnixStream::connect(socket_path)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
+
+    subscribe_tab_focused_events(&mut writer, &mut reader)?;
+    log::info!("subscribed to 'tab.focused' events");
+
+    for line in reader.lines() {
+        let val: serde_json::Value =
+            serde_json::from_str(&line?).map_err(HerdrError::from)?;
+
+        if val.get("event").and_then(serde_json::Value::as_str) == Some("tab_focused") {
+            let tab_id = val
+                .pointer("/data/tab_id")
+                .and_then(serde_json::Value::as_str);
+            if let Some(tab_id) = tab_id
+                && let Err(e) = state.on_tab_focused(tab_id, state_dir)
+            {
+                log::warn!("failed to save state: {e}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fetch_herdr_snapshot(
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Result<Option<String>, Error> {
+    let req_id = format!("{SHORT_PLUGIN_ID}_snapshot");
+    let req_json = json!(
+        {
+            "id": &req_id,
+            "method": "session.snapshot",
+            "params": {}
+        }
+    );
+    writeln!(writer, "{req_json}")?;
+    let snapshot = read_response(reader, &req_id)?;
+
+    let tab_id = snapshot
+        .pointer("/result/snapshot/focused_tab_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    Ok(tab_id)
+}
+
+fn subscribe_tab_focused_events(
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Result<(), Error> {
+    let req_id = format!("{SHORT_PLUGIN_ID}_sub_tab_focused");
+    let req_json = json!(
+        {
+            "id": &req_id,
+            "method": "events.subscribe",
+            "params": {
+                "subscriptions": [
+                    {"type": "tab.focused"}
+                ]
+            }
+        }
+    );
+    writeln!(writer, "{req_json}")?;
+
+    let resp = read_response(reader, &req_id)?;
+    if let Some(err) = resp.get("error") {
+        return Err(HerdrError::SubscriptionFailed(err.to_string()).into());
+    }
+
+    Ok(())
+}
+
+fn read_response(
+    reader: &mut impl BufRead,
+    req_id: &str,
+) -> Result<serde_json::Value, Error> {
+    for line in reader.lines() {
+        let raw = line?;
+        let val: serde_json::Value =
+            serde_json::from_str(&raw).map_err(HerdrError::from)?;
+        let is_response = val
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id == req_id);
+        if is_response {
+            return Ok(val);
+        }
+    }
+    Err(HerdrError::ConnectionClosed.into())
+}
