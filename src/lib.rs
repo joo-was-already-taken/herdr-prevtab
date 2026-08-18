@@ -6,7 +6,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SHORT_PLUGIN_ID: &str = "prevtab";
 
@@ -111,15 +111,36 @@ pub fn jump_back(socket_path: &Path, tab_id: &str) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn run_subscriber(socket_path: &Path, state_path: &Path) -> ! {
-    let mut backoff = Duration::from_millis(10);
-    let max = Duration::from_secs(2);
+pub fn run_subscriber(socket_path: &Path, state_path: &Path) {
+    let min_backoff = Duration::from_millis(10);
+    let max_backoff = Duration::from_secs(2);
+    let mut backoff = min_backoff;
+    let mut max_interval_retries = 0;
+
     loop {
-        if let Err(e) = subscribe_and_run(socket_path, state_path) {
-            log::warn!("{e}, reconnecting in {backoff:?}");
+        let start = Instant::now();
+
+        match subscribe_and_run(socket_path, state_path) {
+            Ok(()) => log::warn!("subscriber connection closed gracefully"),
+            Err(e) => log::warn!("subscriber error: {e}"),
         }
+
+        if start.elapsed() > Duration::from_secs(5) {
+            backoff = min_backoff;
+            max_interval_retries = 0;
+        }
+
+        if backoff == max_backoff {
+            max_interval_retries += 1;
+            if max_interval_retries >= 10 {
+                log::error!("failed to reconnect after multiple attempts, exiting");
+                return;
+            }
+        }
+
+        log::info!("reconnecting in {backoff:?}");
         thread::sleep(backoff);
-        backoff = (backoff * 2).min(max);
+        backoff = (backoff * 2).min(max_backoff);
     }
 }
 
