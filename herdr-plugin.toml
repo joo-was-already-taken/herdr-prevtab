@@ -9,11 +9,7 @@ platforms = ["linux", "macos"]
 command = ["cargo", "build", "--release"]
 
 [[startup]]
-command = [
-  "sh",
-  "-c",
-  "nohup target/release/herdr-prevtab run >/dev/null 2>&1 & disown",
-]
+command = ["target/release/herdr-prevtab", "rund"]
 
 [[actions]]
 id = "jump_back"

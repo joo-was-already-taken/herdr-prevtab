@@ -20,8 +20,8 @@ macro_rules! error {
 #[derive(Parser, Debug)]
 #[command(name = "herdr-prevtab", version, about)]
 enum Cli {
-    /// Start the long-lived tab-focus subscriber.
-    Run,
+    /// Start the long-lived tab-focus subscriber daemon.
+    Rund,
     /// Focus the previous tab and swap state (one-shot).
     JumpBack,
 }
@@ -38,7 +38,12 @@ fn main() {
     );
 
     match cli {
-        Cli::Run => {
+        Cli::Rund => {
+            let res = unsafe { libc::daemon(0, 0) };
+            if res < 0 {
+                error!("failed to daemonize: {}", std::io::Error::last_os_error());
+            }
+
             let lock_path = state_path.join("subscriber.lock");
             let file = OpenOptions::new()
                 .read(true)
