@@ -32,6 +32,8 @@ pub enum HerdrError {
     SubscriptionFailed(String),
     #[error("notification failed: {0}")]
     NotificationFailed(String),
+    #[error("jump back failed: {0}")]
+    JumpBackFailed(String),
 }
 
 pub struct PreviousTabPath<'a> {
@@ -94,6 +96,9 @@ impl CurrentTabs {
 
 pub fn jump_back(socket_path: &Path, tab_id: &str) -> Result<(), Error> {
     let stream = UnixStream::connect(socket_path)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let writer = stream;
+
     let req_id = format!("{SHORT_PLUGIN_ID}_jump_back");
     let req_json = format!(
         "{}",
@@ -108,8 +113,13 @@ pub fn jump_back(socket_path: &Path, tab_id: &str) -> Result<(), Error> {
         )
     );
     assert!(!req_json.contains('\n'));
-    writeln!(&stream, "{req_json}")?;
-    // TODO: wait for the response for better diagnostics
+    writeln!(&writer, "{req_json}")?;
+
+    let resp = read_response(&mut reader, &req_id)?;
+    if let Some(err) = resp.get("error") {
+        Err(HerdrError::JumpBackFailed(err.to_string()))?;
+    }
+
     Ok(())
 }
 
