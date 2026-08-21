@@ -1,11 +1,10 @@
-use herdr_prevtab::{jump_back, run_subscriber};
+use herdr_prevtab::{herdr_notify, jump_back, run_subscriber};
 
 use clap::Parser;
 use rustix::fs::{FlockOperation, flock};
 
 use std::env;
 use std::fs::OpenOptions;
-use std::io;
 use std::path::PathBuf;
 
 macro_rules! error {
@@ -68,17 +67,16 @@ fn main() {
                 ws_id: &workspace_id,
             };
 
-            let previous = match state_file.read() {
-                Ok(id) if !id.is_empty() => id,
-                Ok(_) => {
-                    error!("no previous tab recorded for this workspace");
-                },
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    error!("no previous tab recorded for this workspace");
-                },
-                Err(e) => {
-                    error!("failed to read state for workspace `{workspace_id}`: {e}")
-                },
+            let previous = if let Ok(id) = state_file.read()
+                && !id.is_empty()
+            {
+                id
+            } else {
+                let _ = herdr_notify(
+                    &socket_path,
+                    "No previous tab recorded for this workspace",
+                );
+                error!("no previous tab recorded for this workspace");
             };
 
             if let Err(e) = jump_back(&socket_path, &previous) {

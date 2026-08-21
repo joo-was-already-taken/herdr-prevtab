@@ -30,6 +30,8 @@ pub enum HerdrError {
     UnexpectedJson,
     #[error("subscription failed: {0}")]
     SubscriptionFailed(String),
+    #[error("notification failed: {0}")]
+    NotificationFailed(String),
 }
 
 pub struct PreviousTabPath<'a> {
@@ -227,6 +229,32 @@ fn subscribe_tab_focused_events(
     let resp = read_response(reader, &req_id)?;
     if let Some(err) = resp.get("error") {
         return Err(HerdrError::SubscriptionFailed(err.to_string()).into());
+    }
+
+    Ok(())
+}
+
+pub fn herdr_notify(socket_path: &Path, body: &str) -> Result<(), Error> {
+    let stream = UnixStream::connect(socket_path)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
+
+    let req_id = format!("{SHORT_PLUGIN_ID}_notify");
+    let req_json = json!(
+        {
+            "id": &req_id,
+            "method": "notification.show",
+            "params": {
+                "title": SHORT_PLUGIN_ID,
+                "body": body
+            }
+        }
+    );
+    writeln!(writer, "{req_json}")?;
+
+    let resp = read_response(&mut reader, &req_id)?;
+    if let Some(err) = resp.get("error") {
+        Err(HerdrError::NotificationFailed(err.to_string()))?;
     }
 
     Ok(())
