@@ -1,6 +1,6 @@
 id = "prevtab"
 name = "PrevTab"
-version = "0.1.1"
+version = "0.1.2"
 min_herdr_version = "0.7.0"
 description = "Jump to the previously active tab"
 platforms = ["linux", "macos"]
