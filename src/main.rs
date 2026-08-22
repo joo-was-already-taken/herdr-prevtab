@@ -80,6 +80,10 @@ fn main() {
             };
 
             if let Err(e) = jump_back(&socket_path, &previous) {
+                let _ = herdr_notify(
+                    &socket_path,
+                    "Wasn't able to switch to the previous tab",
+                );
                 error!("{e}");
             }
         },
