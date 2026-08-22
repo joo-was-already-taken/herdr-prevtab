@@ -133,7 +133,7 @@ pub fn run_subscriber(socket_path: &Path, state_path: &Path) {
         let start = Instant::now();
 
         match subscribe_and_run(socket_path, state_path) {
-            Ok(()) => log::warn!("subscriber connection closed gracefully"),
+            Ok(()) => log::info!("subscriber connection closed gracefully"),
             Err(e) => log::warn!("subscriber error: {e}"),
         }
 
