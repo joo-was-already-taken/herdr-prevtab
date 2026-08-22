@@ -4,7 +4,8 @@ use clap::Parser;
 use rustix::fs::{FlockOperation, flock};
 
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
+use std::io;
 use std::path::PathBuf;
 
 macro_rules! error {
@@ -33,8 +34,18 @@ fn main() {
         .map_or_else(|_| error!("HERDR_SOCKET_PATH is not set"), PathBuf::from);
     let state_path = env::var("HERDR_PLUGIN_STATE_DIR").map_or_else(
         |_| error!("HERDR_PLUGIN_STATE_DIR is not set"),
-        PathBuf::from,
+        |state_path| {
+            let session_hash = &herdr_prevtab::session_hash(&socket_path);
+            let session_hash_str = std::str::from_utf8(session_hash).unwrap();
+            PathBuf::from(state_path).join(session_hash_str)
+        },
     );
+
+    if let Err(e) = fs::create_dir(&state_path)
+        && e.kind() != io::ErrorKind::AlreadyExists
+    {
+        error!("failed to create state directory: {e}");
+    }
 
     match cli {
         Cli::Rund => {

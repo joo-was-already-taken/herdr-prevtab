@@ -3,6 +3,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -34,6 +35,21 @@ pub enum HerdrError {
     NotificationFailed(String),
     #[error("jump back failed: {0}")]
     JumpBackFailed(String),
+}
+
+pub const SESSION_HASH_LEN: usize = 12;
+pub type SessionHash = [u8; SESSION_HASH_LEN];
+
+#[must_use]
+pub fn session_hash(socket_path: &Path) -> SessionHash {
+    let charset = b"herd";
+    let mut hash_value = seahash::hash(socket_path.as_os_str().as_bytes());
+    let mut output = [0; SESSION_HASH_LEN];
+    for byte in &mut output {
+        *byte = charset[usize::try_from(hash_value % charset.len() as u64).unwrap()];
+        hash_value /= charset.len() as u64;
+    }
+    output
 }
 
 pub struct PreviousTabPath<'a> {
