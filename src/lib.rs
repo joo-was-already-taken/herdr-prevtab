@@ -52,60 +52,69 @@ pub fn session_hash(socket_path: &Path) -> SessionHash {
     output
 }
 
-pub struct PreviousTabPath<'a> {
-    pub dir: &'a Path,
-    pub ws_id: &'a str,
+pub enum StateFile<'a> {
+    PreviousTab { dir: &'a Path, ws_id: &'a str },
+    PreviousWorkspace { dir: &'a Path },
 }
 
-impl PreviousTabPath<'_> {
+impl StateFile<'_> {
     pub fn read(&self) -> io::Result<String> {
         let content = fs::read_to_string(self.path())?;
         Ok(content.trim().to_string())
     }
 
-    pub fn write(&self, tab_id: &str) -> io::Result<()> {
+    pub fn write(&self, content: &str) -> io::Result<()> {
         let path = self.path();
         let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
         let mut file = fs::File::create(&tmp_path)?;
-        file.write_all(tab_id.as_bytes())?;
+        file.write_all(content.as_bytes())?;
         file.sync_all()?;
         fs::rename(tmp_path, path)?;
         Ok(())
     }
 
     fn path(&self) -> PathBuf {
-        self.dir.join(self.ws_id)
+        match self {
+            Self::PreviousTab { dir, ws_id } => dir.join(ws_id),
+            Self::PreviousWorkspace { dir } => dir.join("prev_workspace"),
+        }
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct CurrentTabs {
     pub current_tabs: BTreeMap<String, String>,
+    pub current_workspace: Option<String>,
 }
 
 impl CurrentTabs {
     pub fn on_tab_focused(
         &mut self,
         tab_id: &str,
+        workspace_id: &str,
         state_dir: &Path,
     ) -> Result<(), Error> {
         use std::collections::btree_map::Entry;
-
-        let Some((workspace_id, _)) = tab_id.split_once(':') else {
-            return Err(HerdrError::InvalidTabFormat(tab_id.to_string()).into());
-        };
 
         let cur_tab_entry = self.current_tabs.entry(workspace_id.to_string());
         if let Entry::Occupied(entry) = &cur_tab_entry
             && entry.get() != tab_id
         {
-            PreviousTabPath {
+            StateFile::PreviousTab {
                 dir: state_dir,
                 ws_id: workspace_id,
             }
             .write(entry.get())?;
         }
         cur_tab_entry.insert_entry(tab_id.to_string());
+
+        if let Some(cur_ws) = &self.current_workspace
+            && cur_ws != workspace_id
+        {
+            StateFile::PreviousWorkspace { dir: state_dir }.write(cur_ws)?;
+        }
+        self.current_workspace = Some(workspace_id.to_string());
+
         Ok(())
     }
 }
@@ -127,6 +136,35 @@ pub fn jump_back(socket_path: &Path, tab_id: &str) -> Result<(), Error> {
                 }
             }
         )
+    );
+    assert!(!req_json.contains('\n'));
+    writeln!(&writer, "{req_json}")?;
+
+    let resp = read_response(&mut reader, &req_id)?;
+    if let Some(err) = resp.get("error") {
+        Err(HerdrError::JumpBackFailed(err.to_string()))?;
+    }
+
+    Ok(())
+}
+
+pub fn workspace_jump_back(socket_path: &Path, workspace_id: &str) -> Result<(), Error> {
+    let stream = UnixStream::connect(socket_path)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let writer = stream;
+
+    let req_id = format!("{SHORT_PLUGIN_ID}_ws_jump_back");
+    let req_json = format!(
+        "{}",
+        json!(
+            {
+                "id": &req_id,
+                "method": "workspace.focus",
+                "params": {
+                    "workspace_id": workspace_id
+                }
+            }
+        ),
     );
     assert!(!req_json.contains('\n'));
     writeln!(&writer, "{req_json}")?;
@@ -177,10 +215,10 @@ fn subscribe_and_run(socket_path: &Path, state_dir: &Path) -> Result<(), Error> 
 
     if let Ok(mut snapshot_stream) = UnixStream::connect(socket_path) {
         let mut snapshot_reader = BufReader::new(snapshot_stream.try_clone()?);
-        if let Ok(Some(tab_id)) =
+        if let Ok(Some((tab_id, workspace_id))) =
             fetch_herdr_snapshot(&mut snapshot_stream, &mut snapshot_reader)
         {
-            let _ = state.on_tab_focused(&tab_id, state_dir);
+            let _ = state.on_tab_focused(&tab_id, &workspace_id, state_dir);
         } else {
             log::warn!("failed to fetch herdr snapshot");
         }
@@ -201,8 +239,11 @@ fn subscribe_and_run(socket_path: &Path, state_dir: &Path) -> Result<(), Error> 
             let tab_id = val
                 .pointer("/data/tab_id")
                 .and_then(serde_json::Value::as_str);
-            if let Some(tab_id) = tab_id
-                && let Err(e) = state.on_tab_focused(tab_id, state_dir)
+            let workspace_id = val
+                .pointer("/data/workspace_id")
+                .and_then(serde_json::Value::as_str);
+            if let (Some(tab_id), Some(workspace_id)) = (tab_id, workspace_id)
+                && let Err(e) = state.on_tab_focused(tab_id, workspace_id, state_dir)
             {
                 log::warn!("failed to save state: {e}");
             }
@@ -214,7 +255,7 @@ fn subscribe_and_run(socket_path: &Path, state_dir: &Path) -> Result<(), Error> 
 fn fetch_herdr_snapshot(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) -> Result<Option<String>, Error> {
+) -> Result<Option<(String, String)>, Error> {
     let req_id = format!("{SHORT_PLUGIN_ID}_snapshot");
     let req_json = json!(
         {
@@ -230,8 +271,16 @@ fn fetch_herdr_snapshot(
         .pointer("/result/snapshot/focused_tab_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    let workspace_id = snapshot
+        .pointer("/result/snapshot/focused_workspace_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
 
-    Ok(tab_id)
+    if let (Some(t), Some(w)) = (tab_id, workspace_id) {
+        Ok(Some((t, w)))
+    } else {
+        Ok(None)
+    }
 }
 
 fn subscribe_tab_focused_events(
