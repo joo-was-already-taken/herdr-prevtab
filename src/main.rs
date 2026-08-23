@@ -54,7 +54,7 @@ fn main() {
                 error!("failed to daemonize: {}", std::io::Error::last_os_error());
             }
 
-            let lock_path = state_path.join("subscriber.lock");
+            let lock_path = state_path.join("writer.lock");
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)

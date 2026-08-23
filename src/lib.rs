@@ -74,7 +74,7 @@ impl PreviousTabPath<'_> {
     }
 
     fn path(&self) -> PathBuf {
-        self.dir.join(format!("ws_{}", self.ws_id))
+        self.dir.join(self.ws_id)
     }
 }
 
