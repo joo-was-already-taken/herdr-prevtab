@@ -1,11 +1,12 @@
 # herdr-prevtab
 
 A plugin for [Herdr](https://herdr.dev/) that allows you to jump back
-to ther previously focused tab, similar to `select-window -t !` in tmux.
+to the previously focused tab (similar to `select-window -t !` in tmux) or workspace.
 
 ## Features
 - **Jump back**: Exposes a `jump_back` action that instantly focuses your last used tab,
     allowing quick toggling between two tabs.
+- **Workspace jump back** (new in *0.2.0*): Exposes a `workspace_jump_back` action that focuses your last used workspace.
 
 ## Requirements
 - Herdr v0.7.0 or higher
@@ -39,4 +40,9 @@ Example configuration:
 key = "prefix+b"
 type = "plugin_action"
 command = "prevtab.jump_back"
+
+[[keys.command]]
+key = "prefix+shift+b"
+type = "plugin_action"
+command = "prevtab.workspace_jump_back"
 ```

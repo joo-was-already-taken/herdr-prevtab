@@ -16,3 +16,9 @@ id = "jump_back"
 title = "Jump to the previously active tab"
 contexts = ["workspace"]
 command = ["target/release/herdr-prevtab", "jump-back"]
+
+[[actions]]
+id = "workspace_jump_back"
+title = "Jump to the previously active workspace"
+contexts = ["global"]
+command = ["target/release/herdr-prevtab", "workspace-jump-back"]
