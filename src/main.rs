@@ -2,11 +2,13 @@ use herdr_prevtab::{herdr_notify, jump_back, run_subscriber};
 
 use clap::Parser;
 use rustix::fs::{FlockOperation, flock};
+use rustix::process::{Pid, Signal, kill_process};
 
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 macro_rules! error {
     ($($args:tt)*) => {
@@ -49,23 +51,53 @@ fn main() {
 
     match cli {
         Cli::Rund => {
-            let res = unsafe { libc::daemon(0, 0) };
-            if res < 0 {
-                error!("failed to daemonize: {}", std::io::Error::last_os_error());
-            }
-
             let lock_path = state_path.join("writer.lock");
-            let file = OpenOptions::new()
+            if let Some(pid) = fs::read_to_string(&lock_path)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+                .and_then(Pid::from_raw)
+            {
+                let _ = kill_process(pid, Signal::TERM);
+            } else {
+                log::debug!("no valid previous daemon PID found in lock file");
+            }
+            let mut file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
-                .truncate(true)
+                .truncate(false)
                 .open(&lock_path)
                 .unwrap_or_else(|e| error!("failed to open lock file: {e}"));
-            if flock(&file, FlockOperation::NonBlockingLockExclusive).is_err() {
+
+            let mut locked = false;
+            for _ in 0..50 {
+                if flock(&file, FlockOperation::NonBlockingLockExclusive).is_ok() {
+                    locked = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if !locked {
+                let _ = herdr_notify(
+                    &socket_path,
+                    "Another daemon instance is already running (failed to acquire lock)",
+                );
                 error!(
                     "another subscriber instance is already running (failed to acquire lock)"
                 );
+            }
+
+            let res = unsafe { libc::daemon(0, 0) };
+            if res < 0 {
+                error!("failed to daemonize: {}", io::Error::last_os_error());
+            }
+
+            if let Err(e) = file
+                .set_len(0)
+                .and_then(|()| file.seek(SeekFrom::Start(0)))
+                .and_then(|_| write!(file, "{}", std::process::id()))
+            {
+                error!("failed to write PID to lock file: {e}");
             }
             run_subscriber(&socket_path, &state_path);
         },
