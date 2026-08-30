@@ -23,18 +23,13 @@ pub enum Error {
 pub enum HerdrError {
     #[error("{0}")]
     InvalidJson(#[from] serde_json::Error),
-    #[error("invalid tab format: '{0}'")]
-    InvalidTabFormat(String),
     #[error("unexpected response")]
     ConnectionClosed,
-    #[error("unexpected JSON")]
-    UnexpectedJson,
-    #[error("subscription failed: {0}")]
-    SubscriptionFailed(String),
-    #[error("notification failed: {0}")]
-    NotificationFailed(String),
-    #[error("jump back failed: {0}")]
-    JumpBackFailed(String),
+    #[error("{method} failed: {detail}")]
+    RequestFailed {
+        method: &'static str,
+        detail: String,
+    },
 }
 
 pub const SESSION_HASH_LEN: usize = 12;
@@ -119,62 +114,85 @@ impl CurrentTabs {
     }
 }
 
-pub fn jump_back(socket_path: &Path, tab_id: &str) -> Result<(), Error> {
-    let stream = UnixStream::connect(socket_path)?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let writer = stream;
+struct HerdrConnection {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+}
 
-    let req_id = format!("{SHORT_PLUGIN_ID}_jump_back");
-    let req_json = format!(
-        "{}",
-        json!(
-            {
-                "id": &req_id,
-                "method": "tab.focus",
-                "params": {
-                    "tab_id": tab_id
-                }
-            }
-        )
-    );
-    assert!(!req_json.contains('\n'));
-    writeln!(&writer, "{req_json}")?;
-
-    let resp = read_response(&mut reader, &req_id)?;
-    if let Some(err) = resp.get("error") {
-        Err(HerdrError::JumpBackFailed(err.to_string()))?;
+impl HerdrConnection {
+    fn connect(socket_path: &Path) -> io::Result<Self> {
+        let stream = UnixStream::connect(socket_path)?;
+        let reader = BufReader::new(stream.try_clone()?);
+        Ok(Self {
+            reader,
+            writer: stream,
+        })
     }
 
+    fn request(
+        &mut self,
+        req_id: &str,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        let req_json = json!({
+            "id": req_id,
+            "method": method,
+            "params": params,
+        });
+        writeln!(&self.writer, "{req_json}")?;
+        self.read_response(req_id)
+    }
+
+    fn read_response(&mut self, req_id: &str) -> Result<serde_json::Value, Error> {
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            if self.reader.read_line(&mut buf)? == 0 {
+                return Err(HerdrError::ConnectionClosed.into());
+            }
+            let val: serde_json::Value =
+                serde_json::from_str(&buf).map_err(HerdrError::from)?;
+            let is_response = val
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id == req_id);
+            if is_response {
+                return Ok(val);
+            }
+        }
+    }
+}
+
+fn resp_ok(resp: &serde_json::Value, method: &'static str) -> Result<(), Error> {
+    if let Some(err) = resp.get("error") {
+        return Err(HerdrError::RequestFailed {
+            method,
+            detail: err.to_string(),
+        }
+        .into());
+    }
     Ok(())
 }
 
+pub fn jump_back(socket_path: &Path, tab_id: &str) -> Result<(), Error> {
+    let mut conn = HerdrConnection::connect(socket_path)?;
+    let resp = conn.request(
+        &format!("{SHORT_PLUGIN_ID}_jump_back"),
+        "tab.focus",
+        &json!({ "tab_id": tab_id }),
+    )?;
+    resp_ok(&resp, "jump back")
+}
+
 pub fn workspace_jump_back(socket_path: &Path, workspace_id: &str) -> Result<(), Error> {
-    let stream = UnixStream::connect(socket_path)?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let writer = stream;
-
-    let req_id = format!("{SHORT_PLUGIN_ID}_ws_jump_back");
-    let req_json = format!(
-        "{}",
-        json!(
-            {
-                "id": &req_id,
-                "method": "workspace.focus",
-                "params": {
-                    "workspace_id": workspace_id
-                }
-            }
-        ),
-    );
-    assert!(!req_json.contains('\n'));
-    writeln!(&writer, "{req_json}")?;
-
-    let resp = read_response(&mut reader, &req_id)?;
-    if let Some(err) = resp.get("error") {
-        Err(HerdrError::JumpBackFailed(err.to_string()))?;
-    }
-
-    Ok(())
+    let mut conn = HerdrConnection::connect(socket_path)?;
+    let resp = conn.request(
+        &format!("{SHORT_PLUGIN_ID}_ws_jump_back"),
+        "workspace.focus",
+        &json!({ "workspace_id": workspace_id }),
+    )?;
+    resp_ok(&resp, "jump back")
 }
 
 pub fn run_subscriber(socket_path: &Path, state_path: &Path) {
@@ -212,28 +230,33 @@ pub fn run_subscriber(socket_path: &Path, state_path: &Path) {
 
 fn subscribe_and_run(socket_path: &Path, state_dir: &Path) -> Result<(), Error> {
     let mut state = CurrentTabs::default();
+    let mut conn = HerdrConnection::connect(socket_path)?;
 
-    if let Ok(mut snapshot_stream) = UnixStream::connect(socket_path) {
-        let mut snapshot_reader = BufReader::new(snapshot_stream.try_clone()?);
-        if let Ok(Some((tab_id, workspace_id))) =
-            fetch_herdr_snapshot(&mut snapshot_stream, &mut snapshot_reader)
-        {
-            let _ = state.on_tab_focused(&tab_id, &workspace_id, state_dir);
-        } else {
-            log::warn!("failed to fetch herdr snapshot");
-        }
+    if let Ok(Some((tab_id, workspace_id))) = fetch_herdr_snapshot(&mut conn) {
+        let _ = state.on_tab_focused(&tab_id, &workspace_id, state_dir);
+    } else {
+        log::warn!("failed to fetch herdr snapshot");
     }
 
-    let stream = UnixStream::connect(socket_path)?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
-
-    subscribe_tab_focused_events(&mut writer, &mut reader)?;
+    subscribe_tab_focused_events(&mut conn)?;
     log::info!("subscribed to 'tab.focused' events");
 
-    for line in reader.lines() {
+    process_events(&mut conn, &mut state, state_dir)
+}
+
+fn process_events(
+    conn: &mut HerdrConnection,
+    state: &mut CurrentTabs,
+    state_dir: &Path,
+) -> Result<(), Error> {
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        if conn.reader.read_line(&mut buf)? == 0 {
+            return Ok(());
+        }
         let val: serde_json::Value =
-            serde_json::from_str(&line?).map_err(HerdrError::from)?;
+            serde_json::from_str(&buf).map_err(HerdrError::from)?;
 
         if val.get("event").and_then(serde_json::Value::as_str) == Some("tab_focused") {
             let tab_id = val
@@ -249,23 +272,16 @@ fn subscribe_and_run(socket_path: &Path, state_dir: &Path) -> Result<(), Error> 
             }
         }
     }
-    Ok(())
 }
 
 fn fetch_herdr_snapshot(
-    writer: &mut impl Write,
-    reader: &mut impl BufRead,
+    conn: &mut HerdrConnection,
 ) -> Result<Option<(String, String)>, Error> {
-    let req_id = format!("{SHORT_PLUGIN_ID}_snapshot");
-    let req_json = json!(
-        {
-            "id": &req_id,
-            "method": "session.snapshot",
-            "params": {}
-        }
-    );
-    writeln!(writer, "{req_json}")?;
-    let snapshot = read_response(reader, &req_id)?;
+    let snapshot = conn.request(
+        &format!("{SHORT_PLUGIN_ID}_snapshot"),
+        "session.snapshot",
+        &json!({}),
+    )?;
 
     let tab_id = snapshot
         .pointer("/result/snapshot/focused_tab_id")
@@ -283,73 +299,21 @@ fn fetch_herdr_snapshot(
     }
 }
 
-fn subscribe_tab_focused_events(
-    writer: &mut impl Write,
-    reader: &mut impl BufRead,
-) -> Result<(), Error> {
-    let req_id = format!("{SHORT_PLUGIN_ID}_sub_tab_focused");
-    let req_json = json!(
-        {
-            "id": &req_id,
-            "method": "events.subscribe",
-            "params": {
-                "subscriptions": [
-                    {"type": "tab.focused"}
-                ]
-            }
-        }
-    );
-    writeln!(writer, "{req_json}")?;
-
-    let resp = read_response(reader, &req_id)?;
-    if let Some(err) = resp.get("error") {
-        return Err(HerdrError::SubscriptionFailed(err.to_string()).into());
-    }
-
-    Ok(())
+fn subscribe_tab_focused_events(conn: &mut HerdrConnection) -> Result<(), Error> {
+    let resp = conn.request(
+        &format!("{SHORT_PLUGIN_ID}_sub_tab_focused"),
+        "events.subscribe",
+        &json!({ "subscriptions": [{"type": "tab.focused"}] }),
+    )?;
+    resp_ok(&resp, "subscription")
 }
 
 pub fn herdr_notify(socket_path: &Path, body: &str) -> Result<(), Error> {
-    let stream = UnixStream::connect(socket_path)?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
-
-    let req_id = format!("{SHORT_PLUGIN_ID}_notify");
-    let req_json = json!(
-        {
-            "id": &req_id,
-            "method": "notification.show",
-            "params": {
-                "title": SHORT_PLUGIN_ID,
-                "body": body
-            }
-        }
-    );
-    writeln!(writer, "{req_json}")?;
-
-    let resp = read_response(&mut reader, &req_id)?;
-    if let Some(err) = resp.get("error") {
-        Err(HerdrError::NotificationFailed(err.to_string()))?;
-    }
-
-    Ok(())
-}
-
-fn read_response(
-    reader: &mut impl BufRead,
-    req_id: &str,
-) -> Result<serde_json::Value, Error> {
-    for line in reader.lines() {
-        let raw = line?;
-        let val: serde_json::Value =
-            serde_json::from_str(&raw).map_err(HerdrError::from)?;
-        let is_response = val
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|id| id == req_id);
-        if is_response {
-            return Ok(val);
-        }
-    }
-    Err(HerdrError::ConnectionClosed.into())
+    let mut conn = HerdrConnection::connect(socket_path)?;
+    let resp = conn.request(
+        &format!("{SHORT_PLUGIN_ID}_notify"),
+        "notification.show",
+        &json!({ "title": SHORT_PLUGIN_ID, "body": body }),
+    )?;
+    resp_ok(&resp, "notification")
 }
