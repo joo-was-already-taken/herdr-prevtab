@@ -230,14 +230,14 @@ pub fn run_subscriber(socket_path: &Path, state_path: &Path) {
 
 fn subscribe_and_run(socket_path: &Path, state_dir: &Path) -> Result<(), Error> {
     let mut state = CurrentTabs::default();
-    let mut conn = HerdrConnection::connect(socket_path)?;
 
-    if let Ok(Some((tab_id, workspace_id))) = fetch_herdr_snapshot(&mut conn) {
+    if let Ok(Some((tab_id, workspace_id))) = fetch_herdr_snapshot(socket_path) {
         let _ = state.on_tab_focused(&tab_id, &workspace_id, state_dir);
     } else {
         log::warn!("failed to fetch herdr snapshot");
     }
 
+    let mut conn = HerdrConnection::connect(socket_path)?;
     subscribe_tab_focused_events(&mut conn)?;
     log::info!("subscribed to 'tab.focused' events");
 
@@ -274,9 +274,8 @@ fn process_events(
     }
 }
 
-fn fetch_herdr_snapshot(
-    conn: &mut HerdrConnection,
-) -> Result<Option<(String, String)>, Error> {
+fn fetch_herdr_snapshot(socket_path: &Path) -> Result<Option<(String, String)>, Error> {
+    let mut conn = HerdrConnection::connect(socket_path)?;
     let snapshot = conn.request(
         &format!("{SHORT_PLUGIN_ID}_snapshot"),
         "session.snapshot",
