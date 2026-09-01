@@ -2,11 +2,12 @@ use herdr_prevtab::{herdr_notify, jump_back, run_subscriber, workspace_jump_back
 
 use clap::Parser;
 use rustix::fs::{FlockOperation, flock};
-use rustix::process::{Pid, Signal, kill_process};
+use rustix::process::{Pid, Signal, kill_process, setsid};
 
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -28,6 +29,39 @@ enum Cli {
     JumpBack,
     /// Focus the previously active workspace (one-shot).
     WorkspaceJumpBack,
+}
+
+/// Detaches into the background and redirects stderr to `log_path`
+fn daemonize(log_path: &Path) -> io::Result<()> {
+    match unsafe { libc::fork() } {
+        -1 => return Err(io::Error::last_os_error()),
+        0 => {},
+        // The parent exits so herdr sees the startup command succeed.
+        _ => unsafe { libc::_exit(0) },
+    }
+
+    setsid()?;
+
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    let null = OpenOptions::new().read(true).open("/dev/null")?;
+    let redirects = [
+        (null.as_raw_fd(), libc::STDIN_FILENO),
+        (log.as_raw_fd(), libc::STDOUT_FILENO),
+        (log.as_raw_fd(), libc::STDERR_FILENO),
+    ];
+    for (from, to) in redirects {
+        if unsafe { libc::dup2(from, to) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if unsafe { libc::chdir(c"/".as_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 fn run_daemon(socket_path: &Path, state_path: &Path) {
@@ -65,9 +99,8 @@ fn run_daemon(socket_path: &Path, state_path: &Path) {
         error!("another subscriber instance is already running (failed to acquire lock)");
     }
 
-    let res = unsafe { libc::daemon(0, 0) };
-    if res < 0 {
-        error!("failed to daemonize: {}", io::Error::last_os_error());
+    if let Err(e) = daemonize(&state_path.join("daemon.log")) {
+        error!("failed to daemonize: {e}");
     }
 
     if let Err(e) = file
