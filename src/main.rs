@@ -6,10 +6,15 @@ use rustix::process::{Pid, Signal, kill_process, setsid};
 
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const PLUGIN_VERSION: &str = env!("PLUGIN_VERSION");
+
+const DAEMON_SHUTDOWN_CMD: &[u8] = b"SHUTDOWN";
 
 macro_rules! error {
     ($($args:tt)*) => {
@@ -21,7 +26,7 @@ macro_rules! error {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "herdr-prevtab", version, about)]
+#[command(name = "herdr-prevtab", version = env!("PLUGIN_VERSION"), about)]
 enum Cli {
     /// Start the long-lived tab-focus subscriber daemon.
     Rund,
@@ -66,20 +71,15 @@ fn daemonize(log_path: &Path) -> io::Result<()> {
 
 fn run_daemon(socket_path: &Path, state_path: &Path) {
     let lock_path = state_path.join("writer.lock");
-    if let Some(pid) = fs::read_to_string(&lock_path)
-        .ok()
-        .and_then(|pid| pid.trim().parse::<i32>().ok())
-        .and_then(Pid::from_raw)
-    {
-        let _ = kill_process(pid, Signal::TERM);
-    } else {
-        log::debug!("no valid previous daemon PID found in lock file");
-    }
-    let mut file = OpenOptions::new()
+    let daemon_sock = state_path.join("daemon.sock");
+    let version_path = state_path.join("daemon.version");
+
+    // Prevent starting two daemons at the same time
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .truncate(false)
+        .truncate(true)
         .open(&lock_path)
         .unwrap_or_else(|e| error!("failed to open lock file: {e}"));
 
@@ -92,25 +92,76 @@ fn run_daemon(socket_path: &Path, state_path: &Path) {
         std::thread::sleep(Duration::from_millis(100));
     }
     if !locked {
-        let _ = herdr_notify(
-            socket_path,
-            "Another daemon instance is already running (failed to acquire lock)",
-        );
         error!("another subscriber instance is already running (failed to acquire lock)");
+    }
+
+    if let Err(e) = fs::write(&version_path, PLUGIN_VERSION) {
+        log::warn!("failed to write daemon version: {e}");
     }
 
     if let Err(e) = daemonize(&state_path.join("daemon.log")) {
         error!("failed to daemonize: {e}");
     }
 
-    if let Err(e) = file
-        .set_len(0)
-        .and_then(|()| file.seek(SeekFrom::Start(0)))
-        .and_then(|_| write!(file, "{}", std::process::id()))
-    {
-        error!("failed to write PID to lock file: {e}");
-    }
+    let _ = fs::remove_file(&daemon_sock);
+    let listener = UnixListener::bind(&daemon_sock)
+        .unwrap_or_else(|e| error!("failed to bind daemon socket: {e}"));
+
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = Vec::new();
+            if stream.read_to_end(&mut buf).is_ok() && buf == DAEMON_SHUTDOWN_CMD {
+                log::info!(
+                    "received {} command, exiting",
+                    std::str::from_utf8(DAEMON_SHUTDOWN_CMD).unwrap()
+                );
+                let _ = fs::remove_file(&daemon_sock);
+                std::process::exit(0);
+            }
+        }
+    });
+
     run_subscriber(socket_path, state_path);
+}
+
+fn ensure_daemon_running(state_path: &Path) {
+    let version_path = state_path.join("daemon.version");
+    let daemon_sock = state_path.join("daemon.sock");
+
+    let running_version = fs::read_to_string(&version_path).unwrap_or_default();
+
+    if running_version.trim() == PLUGIN_VERSION {
+        return;
+    }
+
+    if let Ok(mut stream) = UnixStream::connect(&daemon_sock) {
+        let _ = stream.write_all(DAEMON_SHUTDOWN_CMD);
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let _ = io::copy(&mut stream, &mut io::sink());
+    } else {
+        let lock_path = state_path.join("writer.lock");
+        if let Some(pid) = fs::read_to_string(&lock_path)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+            .and_then(Pid::from_raw)
+        {
+            let _ = kill_process(pid, Signal::TERM);
+        }
+    }
+
+    if let Ok(exe) = env::current_exe() {
+        if let Err(e) = std::process::Command::new(exe).arg("rund").spawn() {
+            log::warn!("failed to autostart daemon: {e}");
+        }
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(1) {
+            if UnixStream::connect(&daemon_sock).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
 }
 
 fn main() {
@@ -137,6 +188,8 @@ fn main() {
     match cli {
         Cli::Rund => run_daemon(&socket_path, &state_path),
         Cli::JumpBack => {
+            ensure_daemon_running(&state_path);
+
             let workspace_id = env::var("HERDR_WORKSPACE_ID")
                 .unwrap_or_else(|_| error!("HERDR_WORKSPACE_ID is not set"));
 
@@ -166,6 +219,8 @@ fn main() {
             }
         },
         Cli::WorkspaceJumpBack => {
+            ensure_daemon_running(&state_path);
+
             let state_file =
                 herdr_prevtab::StateFile::PreviousWorkspace { dir: &state_path };
             let previous_ws = if let Ok(id) = state_file.read()
