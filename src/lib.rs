@@ -114,12 +114,12 @@ impl CurrentTabs {
     }
 }
 
-struct HerdrConnection {
+struct HerdrRpcClient {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
 }
 
-impl HerdrConnection {
+impl HerdrRpcClient {
     fn connect(socket_path: &Path) -> io::Result<Self> {
         let stream = UnixStream::connect(socket_path)?;
         let reader = BufReader::new(stream.try_clone()?);
@@ -127,6 +127,10 @@ impl HerdrConnection {
             reader,
             writer: stream,
         })
+    }
+
+    fn into_reader(self) -> BufReader<UnixStream> {
+        self.reader
     }
 
     fn request(
@@ -140,7 +144,7 @@ impl HerdrConnection {
             "method": method,
             "params": params,
         });
-        writeln!(&self.writer, "{req_json}")?;
+        self.writer.write_all(format!("{req_json}\n").as_bytes())?;
         self.read_response(req_id)
     }
 
@@ -176,7 +180,7 @@ fn resp_ok(resp: &serde_json::Value, method: &'static str) -> Result<(), Error> 
 }
 
 pub fn jump_back(socket_path: &Path, tab_id: &str) -> Result<(), Error> {
-    let mut conn = HerdrConnection::connect(socket_path)?;
+    let mut conn = HerdrRpcClient::connect(socket_path)?;
     let resp = conn.request(
         &format!("{SHORT_PLUGIN_ID}_jump_back"),
         "tab.focus",
@@ -186,7 +190,7 @@ pub fn jump_back(socket_path: &Path, tab_id: &str) -> Result<(), Error> {
 }
 
 pub fn workspace_jump_back(socket_path: &Path, workspace_id: &str) -> Result<(), Error> {
-    let mut conn = HerdrConnection::connect(socket_path)?;
+    let mut conn = HerdrRpcClient::connect(socket_path)?;
     let resp = conn.request(
         &format!("{SHORT_PLUGIN_ID}_ws_jump_back"),
         "workspace.focus",
@@ -237,22 +241,22 @@ fn subscribe_and_run(socket_path: &Path, state_dir: &Path) -> Result<(), Error> 
         log::warn!("failed to fetch herdr snapshot");
     }
 
-    let mut conn = HerdrConnection::connect(socket_path)?;
-    subscribe_tab_focused_events(&mut conn)?;
+    let mut rpc = HerdrRpcClient::connect(socket_path)?;
+    subscribe_tab_focused_events(&mut rpc)?;
     log::info!("subscribed to 'tab.focused' events");
 
-    process_events(&mut conn, &mut state, state_dir)
+    process_events(rpc.into_reader(), &mut state, state_dir)
 }
 
 fn process_events(
-    conn: &mut HerdrConnection,
+    mut reader: BufReader<UnixStream>,
     state: &mut CurrentTabs,
     state_dir: &Path,
 ) -> Result<(), Error> {
     let mut buf = String::new();
     loop {
         buf.clear();
-        if conn.reader.read_line(&mut buf)? == 0 {
+        if reader.read_line(&mut buf)? == 0 {
             return Ok(());
         }
         let val: serde_json::Value =
@@ -275,7 +279,7 @@ fn process_events(
 }
 
 fn fetch_herdr_snapshot(socket_path: &Path) -> Result<Option<(String, String)>, Error> {
-    let mut conn = HerdrConnection::connect(socket_path)?;
+    let mut conn = HerdrRpcClient::connect(socket_path)?;
     let snapshot = conn.request(
         &format!("{SHORT_PLUGIN_ID}_snapshot"),
         "session.snapshot",
@@ -298,7 +302,7 @@ fn fetch_herdr_snapshot(socket_path: &Path) -> Result<Option<(String, String)>, 
     }
 }
 
-fn subscribe_tab_focused_events(conn: &mut HerdrConnection) -> Result<(), Error> {
+fn subscribe_tab_focused_events(conn: &mut HerdrRpcClient) -> Result<(), Error> {
     let resp = conn.request(
         &format!("{SHORT_PLUGIN_ID}_sub_tab_focused"),
         "events.subscribe",
@@ -308,7 +312,7 @@ fn subscribe_tab_focused_events(conn: &mut HerdrConnection) -> Result<(), Error>
 }
 
 pub fn herdr_notify(socket_path: &Path, body: &str) -> Result<(), Error> {
-    let mut conn = HerdrConnection::connect(socket_path)?;
+    let mut conn = HerdrRpcClient::connect(socket_path)?;
     let resp = conn.request(
         &format!("{SHORT_PLUGIN_ID}_notify"),
         "notification.show",
