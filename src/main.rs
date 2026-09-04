@@ -2,12 +2,11 @@ use herdr_prevtab::{herdr_notify, jump_back, run_subscriber, workspace_jump_back
 
 use clap::Parser;
 use rustix::fs::{FlockOperation, flock};
-use rustix::process::{Pid, Signal, kill_process, setsid};
+use rustix::process::{Pid, Signal, kill_process, setsid, umask};
 
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -36,35 +35,34 @@ enum Cli {
     WorkspaceJumpBack,
 }
 
-/// Detaches into the background and redirects stderr to `log_path`
-fn daemonize(log_path: &Path) -> io::Result<()> {
-    match unsafe { libc::fork() } {
-        -1 => return Err(io::Error::last_os_error()),
-        0 => {},
-        // The parent exits so herdr sees the startup command succeed.
-        _ => unsafe { libc::_exit(0) },
+/// Detaches into the background and redirects stderr to `log_path`.
+/// Unsafe to call when already spawned other threads.
+unsafe fn daemonize(log_path: &Path) -> io::Result<()> {
+    unsafe fn fork() -> io::Result<()> {
+        match unsafe { libc::fork() } {
+            -1 => Err(io::Error::last_os_error()),
+            0 => Ok(()),
+            _ => unsafe { libc::_exit(0) },
+        }
     }
 
+    unsafe { fork()? };
     setsid()?;
+    unsafe { fork()? };
+
+    umask(rustix::fs::Mode::empty());
+
+    env::set_current_dir("/")?;
 
     let log = OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)?;
     let null = OpenOptions::new().read(true).open("/dev/null")?;
-    let redirects = [
-        (null.as_raw_fd(), libc::STDIN_FILENO),
-        (log.as_raw_fd(), libc::STDOUT_FILENO),
-        (log.as_raw_fd(), libc::STDERR_FILENO),
-    ];
-    for (from, to) in redirects {
-        if unsafe { libc::dup2(from, to) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    if unsafe { libc::chdir(c"/".as_ptr()) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
+
+    rustix::stdio::dup2_stdin(&null)?;
+    rustix::stdio::dup2_stdout(&log)?;
+    rustix::stdio::dup2_stderr(&log)?;
 
     Ok(())
 }
@@ -99,7 +97,7 @@ fn run_daemon(socket_path: &Path, state_path: &Path) {
         log::warn!("failed to write daemon version: {e}");
     }
 
-    if let Err(e) = daemonize(&state_path.join("daemon.log")) {
+    if let Err(e) = unsafe { daemonize(&state_path.join("daemon.log")) } {
         error!("failed to daemonize: {e}");
     }
 
