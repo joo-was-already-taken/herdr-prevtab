@@ -133,6 +133,7 @@ fn ensure_daemon_running(state_path: &Path) {
     }
 
     if let Ok(mut stream) = UnixStream::connect(&daemon_sock) {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
         let _ = stream.write_all(DAEMON_SHUTDOWN_CMD);
         let _ = stream.shutdown(std::net::Shutdown::Write);
         let _ = io::copy(&mut stream, &mut io::sink());
