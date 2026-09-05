@@ -122,7 +122,7 @@ fn run_daemon(socket_path: &Path, state_path: &Path) {
     run_subscriber(socket_path, state_path);
 }
 
-fn ensure_daemon_running(state_path: &Path) {
+fn ensure_daemon_running(state_path: &Path, socket_path: &Path) {
     let version_path = state_path.join("daemon.version");
     let daemon_sock = state_path.join("daemon.sock");
 
@@ -136,7 +136,19 @@ fn ensure_daemon_running(state_path: &Path) {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
         let _ = stream.write_all(DAEMON_SHUTDOWN_CMD);
         let _ = stream.shutdown(std::net::Shutdown::Write);
-        let _ = io::copy(&mut stream, &mut io::sink());
+        let copy_res = io::copy(&mut stream, &mut io::sink());
+        if let Err(e) = copy_res
+            && matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut,
+            )
+        {
+            let _ = herdr_notify(
+                socket_path,
+                "Could not shutdown the old daemon, please run `pkill herdr-prevtab`",
+            );
+            log::warn!("Could not shutdown the old daemon: {e}");
+        }
     } else {
         let lock_path = state_path.join("writer.lock");
         if let Some(pid) = fs::read_to_string(&lock_path)
@@ -187,7 +199,7 @@ fn main() {
     match cli {
         Cli::Rund => run_daemon(&socket_path, &state_path),
         Cli::JumpBack => {
-            ensure_daemon_running(&state_path);
+            ensure_daemon_running(&state_path, &socket_path);
 
             let workspace_id = env::var("HERDR_WORKSPACE_ID")
                 .unwrap_or_else(|_| error!("HERDR_WORKSPACE_ID is not set"));
@@ -218,7 +230,7 @@ fn main() {
             }
         },
         Cli::WorkspaceJumpBack => {
-            ensure_daemon_running(&state_path);
+            ensure_daemon_running(&state_path, &socket_path);
 
             let state_file =
                 herdr_prevtab::StateFile::PreviousWorkspace { dir: &state_path };
