@@ -9,7 +9,7 @@ to the previously focused tab (similar to `select-window -t !` in tmux) or works
 - **Workspace jump back** (new in *0.2.0*): Exposes a `workspace_jump_back` action that focuses your last used workspace.
 
 ## Requirements
-- Herdr v0.7.0 or higher
+- Herdr v0.7.0 - v0.8.x (broken on v0.9.0 due to regression - [GitHub Issue](https://github.com/herdrdev/herdr/issues/3801))
 - Linux or macOS
 - Cargo (when not installing with Nix)
 
